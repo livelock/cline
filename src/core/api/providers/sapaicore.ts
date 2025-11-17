@@ -10,6 +10,7 @@ import axios from "axios"
 import OpenAI from "openai"
 import { ClineStorageMessage } from "@/shared/messages/content"
 import { getAxiosSettings } from "@/shared/net"
+import { ClineTool } from "@/shared/tools"
 import { ApiHandler, CommonApiHandlerOptions } from "../"
 import { withRetry } from "../retry"
 import { convertToOpenAiMessages } from "../transform/openai-format"
@@ -76,6 +77,32 @@ namespace Bedrock {
 		}
 
 		return [{ text: systemPrompt }]
+	}
+
+	/**
+	 * Converts Anthropic tools format to AWS Bedrock toolConfig format
+	 * Bedrock expects tools wrapped in toolSpec with inputSchema instead of input_schema
+	 */
+	export function convertToBedrockToolConfig(tools?: ClineTool[]): any {
+		if (!tools || tools.length === 0) {
+			return undefined
+		}
+
+		// Convert Anthropic tools to Bedrock format
+		const bedrockTools = tools.map((tool: any) => ({
+			toolSpec: {
+				name: tool.name,
+				description: tool.description,
+				inputSchema: {
+					json: tool.input_schema || tool.inputSchema,
+				},
+			},
+		}))
+
+		return {
+			tools: bedrockTools,
+			toolChoice: { auto: {} }, // Default to auto mode
+		}
 	}
 
 	/**
@@ -459,11 +486,11 @@ export class SapAiCoreHandler implements ApiHandler {
 	}
 
 	@withRetry()
-	async *createMessage(systemPrompt: string, messages: ClineStorageMessage[]): ApiStream {
+	async *createMessage(systemPrompt: string, messages: ClineStorageMessage[], tools?: ClineTool[]): ApiStream {
 		if (this.options.sapAiCoreUseOrchestrationMode) {
-			yield* this.createMessageWithOrchestration(systemPrompt, messages)
+			yield* this.createMessageWithOrchestration(systemPrompt, messages, tools)
 		} else {
-			yield* this.createMessageWithDeployments(systemPrompt, messages)
+			yield* this.createMessageWithDeployments(systemPrompt, messages, tools)
 		}
 	}
 
@@ -491,7 +518,7 @@ export class SapAiCoreHandler implements ApiHandler {
 		this.isAiCoreEnvSetup = true
 	}
 
-	private async *createMessageWithOrchestration(systemPrompt: string, messages: ClineStorageMessage[]): ApiStream {
+	private async *createMessageWithOrchestration(systemPrompt: string, messages: ClineStorageMessage[], tools?: ClineTool[]): ApiStream {
 		try {
 			// Ensure AI Core environment variable is set up (only runs once)
 			this.ensureAiCoreEnvSetup()
@@ -541,7 +568,7 @@ export class SapAiCoreHandler implements ApiHandler {
 		}
 	}
 
-	private async *createMessageWithDeployments(systemPrompt: string, messages: ClineStorageMessage[]): ApiStream {
+	private async *createMessageWithDeployments(systemPrompt: string, messages: ClineStorageMessage[], tools?: ClineTool[]): ApiStream {
 		const token = await this.getToken()
 		const headers = {
 			Authorization: `Bearer ${token}`,
@@ -623,6 +650,9 @@ export class SapAiCoreHandler implements ApiHandler {
 				// Prepare system message with caching support (enabled by default)
 				const systemMessages = Bedrock.prepareSystemMessages(systemPrompt, true)
 
+				// Convert tools to Bedrock toolConfig format
+				const toolConfig = Bedrock.convertToBedrockToolConfig(tools)
+
 				payload = {
 					inferenceConfig: {
 						maxTokens: model.info.maxTokens,
@@ -630,6 +660,7 @@ export class SapAiCoreHandler implements ApiHandler {
 					},
 					system: systemMessages,
 					messages: messagesWithCache,
+					...(toolConfig && { toolConfig }),
 				}
 			} else {
 				// Use invoke-with-response-stream endpoint
@@ -818,6 +849,7 @@ export class SapAiCoreHandler implements ApiHandler {
 		}
 
 		const _usage = { input_tokens: 0, output_tokens: 0 }
+		const lastStartedToolCall = { id: "", name: "", arguments: "" }
 
 		try {
 			// Iterate over the stream and process each chunk
@@ -849,7 +881,18 @@ export class SapAiCoreHandler implements ApiHandler {
 								}
 							}
 
-							// Handle content block delta (text generation)
+							// Handle content block start (for tool use)
+							if (data.contentBlockStart) {
+								const startBlock = data.contentBlockStart?.start
+								if (startBlock?.toolUse) {
+									// Tool use started - store the tool ID and name
+									lastStartedToolCall.id = startBlock.toolUse.toolUseId
+									lastStartedToolCall.name = startBlock.toolUse.name
+									lastStartedToolCall.arguments = ""
+								}
+							}
+
+							// Handle content block delta (text generation and tool input)
 							if (data.contentBlockDelta) {
 								if (data.contentBlockDelta?.delta?.text) {
 									yield {
@@ -865,6 +908,33 @@ export class SapAiCoreHandler implements ApiHandler {
 										reasoning: data.contentBlockDelta.delta.reasoningContent.text,
 									}
 								}
+
+								// Handle tool use input delta (Bedrock format)
+								if (data.contentBlockDelta?.delta?.toolUse?.input && lastStartedToolCall.id) {
+									// Accumulate the tool input as it streams in
+									const inputDelta = data.contentBlockDelta.delta.toolUse.input
+									// Yield tool_calls event in OpenAI-compatible format
+									yield {
+										type: "tool_calls",
+										tool_call: {
+											...lastStartedToolCall,
+											function: {
+												...lastStartedToolCall,
+												id: lastStartedToolCall.id,
+												name: lastStartedToolCall.name,
+												arguments: inputDelta,
+											},
+										},
+									}
+								}
+							}
+
+							// Handle content block stop (for tool use completion)
+							if (data.contentBlockStop) {
+								// Reset tool call tracking
+								lastStartedToolCall.id = ""
+								lastStartedToolCall.name = ""
+								lastStartedToolCall.arguments = ""
 							}
 						} catch (error) {
 							console.error("Failed to parse JSON data:", error)
