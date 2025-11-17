@@ -10,6 +10,7 @@ import axios from "axios"
 import OpenAI from "openai"
 import { ClineStorageMessage } from "@/shared/messages/content"
 import { getAxiosSettings } from "@/shared/net"
+import { ClineTool } from "@/shared/tools"
 import { ApiHandler, CommonApiHandlerOptions } from "../"
 import { withRetry } from "../retry"
 import { convertToOpenAiMessages } from "../transform/openai-format"
@@ -76,6 +77,61 @@ namespace Bedrock {
 		}
 
 		return [{ text: systemPrompt }]
+	}
+
+	/**
+	 * Converts ClineTool to Anthropic tool format for invoke-with-response-stream endpoint
+	 * Returns tools in Anthropic's native format
+	 */
+	export function convertToAnthropicTools(tools?: ClineTool[]): any[] | undefined {
+		if (!tools || tools.length === 0) {
+			return undefined
+		}
+
+		// ClineTool can be Anthropic, OpenAI, or Google format
+		// For Anthropic models, we need Anthropic format
+		return tools.map((tool: any) => {
+			// If it's already in Anthropic format, return as-is
+			if (tool.input_schema) {
+				return tool
+			}
+			// Convert from OpenAI format if needed
+			if (tool.function) {
+				return {
+					name: tool.function.name,
+					description: tool.function.description,
+					input_schema: tool.function.parameters,
+				}
+			}
+			// Assume it's already in the right format
+			return tool
+		})
+	}
+
+	/**
+	 * Converts Anthropic tools format to AWS Bedrock toolConfig format
+	 * Bedrock expects tools wrapped in toolSpec with inputSchema instead of input_schema
+	 */
+	export function convertToBedrockToolConfig(tools?: ClineTool[]): any {
+		if (!tools || tools.length === 0) {
+			return undefined
+		}
+
+		// Convert Anthropic tools to Bedrock format
+		const bedrockTools = tools.map((tool: any) => ({
+			toolSpec: {
+				name: tool.name,
+				description: tool.description,
+				inputSchema: {
+					json: tool.input_schema || tool.inputSchema,
+				},
+			},
+		}))
+
+		return {
+			tools: bedrockTools,
+			toolChoice: { auto: {} }, // Default to auto mode
+		}
 	}
 
 	/**
@@ -459,11 +515,11 @@ export class SapAiCoreHandler implements ApiHandler {
 	}
 
 	@withRetry()
-	async *createMessage(systemPrompt: string, messages: ClineStorageMessage[]): ApiStream {
+	async *createMessage(systemPrompt: string, messages: ClineStorageMessage[], tools?: ClineTool[]): ApiStream {
 		if (this.options.sapAiCoreUseOrchestrationMode) {
-			yield* this.createMessageWithOrchestration(systemPrompt, messages)
+			yield* this.createMessageWithOrchestration(systemPrompt, messages, tools)
 		} else {
-			yield* this.createMessageWithDeployments(systemPrompt, messages)
+			yield* this.createMessageWithDeployments(systemPrompt, messages, tools)
 		}
 	}
 
@@ -491,7 +547,7 @@ export class SapAiCoreHandler implements ApiHandler {
 		this.isAiCoreEnvSetup = true
 	}
 
-	private async *createMessageWithOrchestration(systemPrompt: string, messages: ClineStorageMessage[]): ApiStream {
+	private async *createMessageWithOrchestration(systemPrompt: string, messages: ClineStorageMessage[], tools?: ClineTool[]): ApiStream {
 		try {
 			// Ensure AI Core environment variable is set up (only runs once)
 			this.ensureAiCoreEnvSetup()
@@ -541,7 +597,7 @@ export class SapAiCoreHandler implements ApiHandler {
 		}
 	}
 
-	private async *createMessageWithDeployments(systemPrompt: string, messages: ClineStorageMessage[]): ApiStream {
+	private async *createMessageWithDeployments(systemPrompt: string, messages: ClineStorageMessage[], tools?: ClineTool[]): ApiStream {
 		const token = await this.getToken()
 		const headers = {
 			Authorization: `Bearer ${token}`,
@@ -623,6 +679,9 @@ export class SapAiCoreHandler implements ApiHandler {
 				// Prepare system message with caching support (enabled by default)
 				const systemMessages = Bedrock.prepareSystemMessages(systemPrompt, true)
 
+				// Convert tools to Bedrock toolConfig format
+				const toolConfig = Bedrock.convertToBedrockToolConfig(tools)
+
 				payload = {
 					inferenceConfig: {
 						maxTokens: model.info.maxTokens,
@@ -630,15 +689,19 @@ export class SapAiCoreHandler implements ApiHandler {
 					},
 					system: systemMessages,
 					messages: messagesWithCache,
+					...(toolConfig && { toolConfig }),
 				}
 			} else {
 				// Use invoke-with-response-stream endpoint
 				// TODO: add caching support using Anthropic-native cache_control blocks
+				const anthropicTools = Bedrock.convertToAnthropicTools(tools)
+
 				payload = {
 					max_tokens: model.info.maxTokens,
 					system: systemPrompt,
 					messages,
 					anthropic_version: "bedrock-2023-05-31",
+					...(anthropicTools && { tools: anthropicTools }),
 				}
 			}
 		} else if (openAIModels.includes(model.id)) {
@@ -760,6 +823,7 @@ export class SapAiCoreHandler implements ApiHandler {
 		_model: { id: SapAiCoreModelId; info: ModelInfo },
 	): AsyncGenerator<any, void, unknown> {
 		const usage = { input_tokens: 0, output_tokens: 0 }
+		const lastStartedToolCall = { id: "", name: "", arguments: "" }
 
 		try {
 			for await (const chunk of stream) {
@@ -776,15 +840,50 @@ export class SapAiCoreHandler implements ApiHandler {
 									inputTokens: usage.input_tokens,
 									outputTokens: usage.output_tokens,
 								}
-							} else if (data.type === "content_block_start" || data.type === "content_block_delta") {
-								const contentBlock = data.type === "content_block_start" ? data.content_block : data.delta
+							} else if (data.type === "content_block_start") {
+								const contentBlock = data.content_block
 
-								if (contentBlock.type === "text" || contentBlock.type === "text_delta") {
+								if (contentBlock.type === "text") {
 									yield {
 										type: "text",
 										text: contentBlock.text || "",
 									}
+								} else if (contentBlock.type === "tool_use") {
+									// Store tool use info for later
+									lastStartedToolCall.id = contentBlock.id
+									lastStartedToolCall.name = contentBlock.name
+									lastStartedToolCall.arguments = ""
 								}
+							} else if (data.type === "content_block_delta") {
+								const delta = data.delta
+
+								if (delta.type === "text_delta") {
+									yield {
+										type: "text",
+										text: delta.text || "",
+									}
+								} else if (delta.type === "input_json_delta") {
+									// Handle tool use input streaming
+									if (lastStartedToolCall.id && lastStartedToolCall.name && delta.partial_json) {
+										yield {
+											type: "tool_calls",
+											tool_call: {
+												...lastStartedToolCall,
+												function: {
+													...lastStartedToolCall,
+													id: lastStartedToolCall.id,
+													name: lastStartedToolCall.name,
+													arguments: delta.partial_json,
+												},
+											},
+										}
+									}
+								}
+							} else if (data.type === "content_block_stop") {
+								// Reset tool call tracking
+								lastStartedToolCall.id = ""
+								lastStartedToolCall.name = ""
+								lastStartedToolCall.arguments = ""
 							} else if (data.type === "message_delta") {
 								if (data.usage) {
 									usage.output_tokens = data.usage.output_tokens
@@ -818,6 +917,7 @@ export class SapAiCoreHandler implements ApiHandler {
 		}
 
 		const _usage = { input_tokens: 0, output_tokens: 0 }
+		const lastStartedToolCall = { id: "", name: "", arguments: "" }
 
 		try {
 			// Iterate over the stream and process each chunk
@@ -849,7 +949,18 @@ export class SapAiCoreHandler implements ApiHandler {
 								}
 							}
 
-							// Handle content block delta (text generation)
+							// Handle content block start (for tool use)
+							if (data.contentBlockStart) {
+								const startBlock = data.contentBlockStart?.start
+								if (startBlock?.toolUse) {
+									// Tool use started - store the tool ID and name
+									lastStartedToolCall.id = startBlock.toolUse.toolUseId
+									lastStartedToolCall.name = startBlock.toolUse.name
+									lastStartedToolCall.arguments = ""
+								}
+							}
+
+							// Handle content block delta (text generation and tool input)
 							if (data.contentBlockDelta) {
 								if (data.contentBlockDelta?.delta?.text) {
 									yield {
@@ -865,6 +976,33 @@ export class SapAiCoreHandler implements ApiHandler {
 										reasoning: data.contentBlockDelta.delta.reasoningContent.text,
 									}
 								}
+
+								// Handle tool use input delta (Bedrock format)
+								if (data.contentBlockDelta?.delta?.toolUse?.input && lastStartedToolCall.id) {
+									// Accumulate the tool input as it streams in
+									const inputDelta = data.contentBlockDelta.delta.toolUse.input
+									// Yield tool_calls event in OpenAI-compatible format
+									yield {
+										type: "tool_calls",
+										tool_call: {
+											...lastStartedToolCall,
+											function: {
+												...lastStartedToolCall,
+												id: lastStartedToolCall.id,
+												name: lastStartedToolCall.name,
+												arguments: inputDelta,
+											},
+										},
+									}
+								}
+							}
+
+							// Handle content block stop (for tool use completion)
+							if (data.contentBlockStop) {
+								// Reset tool call tracking
+								lastStartedToolCall.id = ""
+								lastStartedToolCall.name = ""
+								lastStartedToolCall.arguments = ""
 							}
 						} catch (error) {
 							console.error("Failed to parse JSON data:", error)
