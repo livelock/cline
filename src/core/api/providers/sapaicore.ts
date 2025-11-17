@@ -80,6 +80,35 @@ namespace Bedrock {
 	}
 
 	/**
+	 * Converts ClineTool to Anthropic tool format for invoke-with-response-stream endpoint
+	 * Returns tools in Anthropic's native format
+	 */
+	export function convertToAnthropicTools(tools?: ClineTool[]): any[] | undefined {
+		if (!tools || tools.length === 0) {
+			return undefined
+		}
+
+		// ClineTool can be Anthropic, OpenAI, or Google format
+		// For Anthropic models, we need Anthropic format
+		return tools.map((tool: any) => {
+			// If it's already in Anthropic format, return as-is
+			if (tool.input_schema) {
+				return tool
+			}
+			// Convert from OpenAI format if needed
+			if (tool.function) {
+				return {
+					name: tool.function.name,
+					description: tool.function.description,
+					input_schema: tool.function.parameters,
+				}
+			}
+			// Assume it's already in the right format
+			return tool
+		})
+	}
+
+	/**
 	 * Converts Anthropic tools format to AWS Bedrock toolConfig format
 	 * Bedrock expects tools wrapped in toolSpec with inputSchema instead of input_schema
 	 */
@@ -665,11 +694,14 @@ export class SapAiCoreHandler implements ApiHandler {
 			} else {
 				// Use invoke-with-response-stream endpoint
 				// TODO: add caching support using Anthropic-native cache_control blocks
+				const anthropicTools = Bedrock.convertToAnthropicTools(tools)
+
 				payload = {
 					max_tokens: model.info.maxTokens,
 					system: systemPrompt,
 					messages,
 					anthropic_version: "bedrock-2023-05-31",
+					...(anthropicTools && { tools: anthropicTools }),
 				}
 			}
 		} else if (openAIModels.includes(model.id)) {
@@ -791,6 +823,7 @@ export class SapAiCoreHandler implements ApiHandler {
 		_model: { id: SapAiCoreModelId; info: ModelInfo },
 	): AsyncGenerator<any, void, unknown> {
 		const usage = { input_tokens: 0, output_tokens: 0 }
+		const lastStartedToolCall = { id: "", name: "", arguments: "" }
 
 		try {
 			for await (const chunk of stream) {
@@ -807,15 +840,50 @@ export class SapAiCoreHandler implements ApiHandler {
 									inputTokens: usage.input_tokens,
 									outputTokens: usage.output_tokens,
 								}
-							} else if (data.type === "content_block_start" || data.type === "content_block_delta") {
-								const contentBlock = data.type === "content_block_start" ? data.content_block : data.delta
+							} else if (data.type === "content_block_start") {
+								const contentBlock = data.content_block
 
-								if (contentBlock.type === "text" || contentBlock.type === "text_delta") {
+								if (contentBlock.type === "text") {
 									yield {
 										type: "text",
 										text: contentBlock.text || "",
 									}
+								} else if (contentBlock.type === "tool_use") {
+									// Store tool use info for later
+									lastStartedToolCall.id = contentBlock.id
+									lastStartedToolCall.name = contentBlock.name
+									lastStartedToolCall.arguments = ""
 								}
+							} else if (data.type === "content_block_delta") {
+								const delta = data.delta
+
+								if (delta.type === "text_delta") {
+									yield {
+										type: "text",
+										text: delta.text || "",
+									}
+								} else if (delta.type === "input_json_delta") {
+									// Handle tool use input streaming
+									if (lastStartedToolCall.id && lastStartedToolCall.name && delta.partial_json) {
+										yield {
+											type: "tool_calls",
+											tool_call: {
+												...lastStartedToolCall,
+												function: {
+													...lastStartedToolCall,
+													id: lastStartedToolCall.id,
+													name: lastStartedToolCall.name,
+													arguments: delta.partial_json,
+												},
+											},
+										}
+									}
+								}
+							} else if (data.type === "content_block_stop") {
+								// Reset tool call tracking
+								lastStartedToolCall.id = ""
+								lastStartedToolCall.name = ""
+								lastStartedToolCall.arguments = ""
 							} else if (data.type === "message_delta") {
 								if (data.usage) {
 									usage.output_tokens = data.usage.output_tokens
